@@ -452,103 +452,195 @@ class MarsWorld:
             sc = ctx.camera.world_to_screen(p)
             pygame.draw.circle(ctx.screen, (255, 50, 50), sc, 3) # Little red dots
 
-    def _draw_regions(self, ctx: RenderContext):
-        # Draw Voronoi Regions
-        if self.region_map is None: return
+    def _get_visible_bounds(self, ctx: RenderContext):
+        # Calculate visible world bounds in tiles
+        # 1. Screen bounds
+        sw, sh = ctx.screen.get_size()
+        tl_world = ctx.camera.screen_to_world((0, 0))
+        br_world = ctx.camera.screen_to_world((sw, sh))
+        
+        # 2. Convert to Tile indices
+        ts = self.ts
+        tx0 = int(math.floor(tl_world[0] / ts))
+        ty0 = int(math.floor(tl_world[1] / ts))
+        tx1 = int(math.ceil(br_world[0] / ts)) + 1
+        ty1 = int(math.ceil(br_world[1] / ts)) + 1
+        
+        # 3. Clamp to Map Constraints
+        w_tiles, h_tiles = self.shape_tiles
+        
+        tx0 = max(0, tx0)
+        ty0 = max(0, ty0)
+        tx1 = min(w_tiles, tx1)
+        ty1 = min(h_tiles, ty1)
+        
+        return tx0, tx1, ty0, ty1
+
+    def _blit_slice(self, ctx: RenderContext, surface: pygame.Surface, tx0, ty0):
+        # Blit a surface representing tiles starting at tx0, ty0
         ts = self.ts
         
-        # Iterate and draw
-        for tile, region_id in np.ndenumerate(self.region_map):
-            color = self.region_colors.get(region_id, (0,0,0))
-            draw_tile(ctx, tile, ts, color)
+        # World position of the top-left of this slice
+        world_x = tx0 * ts
+        world_y = ty0 * ts
+        
+        # Determine world size of the slice
+        # surface.get_width() is in tiles (pixels of the surface)
+        # So in world units: width * ts
+        dim_tiles_w = surface.get_width()
+        dim_tiles_h = surface.get_height()
+        
+        if dim_tiles_w == 0 or dim_tiles_h == 0:
+            return
+
+        world_w = dim_tiles_w * ts
+        world_h = dim_tiles_h * ts
+        
+        # Screen Rect
+        # We assume axis aligned (no rotation)
+        p0 = ctx.camera.world_to_screen((world_x, world_y))
+        p1 = ctx.camera.world_to_screen((world_x + world_w, world_y + world_h))
+        
+        # Ceil proper scaling to avoid gaps?
+        # int() truncates. If we want smooth tiling, we might need a +1 buffer or fblitting.
+        # But pygame blits to ints.
+        
+        scr_w = p1[0] - p0[0]
+        scr_h = p1[1] - p0[1]
+        
+        # Optimize: If scale is 1:1, don't scale
+        # But our "surface pixel" is a "tile".
+        # If zoom puts 1 tile = 1 screen pixel, then scale is 1.0.
+        # But ts=4. zoom=1 -> 1 tile = 4 screen pixels.
+        
+        if scr_w > 0 and scr_h > 0:
+            # Scale
+            scaled = pygame.transform.scale(surface, (scr_w, scr_h))
+            ctx.screen.blit(scaled, p0)
+
+    def _draw_regions(self, ctx: RenderContext):
+        # Vectorized Region Draw with Culling
+        if self.region_map is None: return
+        
+        tx0, tx1, ty0, ty1 = self._get_visible_bounds(ctx)
+        if tx1 <= tx0 or ty1 <= ty0: return
+        
+        # Slice
+        sub_map = self.region_map[tx0:tx1, ty0:ty1]
+        
+        # Create palette (cached ideally, but cheap enough for 100 regions)
+        # Find max region ID from keys locally or assume generous bounds
+        max_id = 120 
+        if self.region_colors:
+             max_id = max(max_id, max(self.region_colors.keys()))
+             
+        palette = np.zeros((max_id + 1, 3), dtype=np.uint8)
+        for rid, col in self.region_colors.items():
+            if rid <= max_id:
+                palette[rid] = col
+                
+        # Index directly (Safe if region_map has valid IDs)
+        # region_map values come from poisson points len. usually 100.
+        
+        pixels = palette[sub_map] # (W_slice, H_slice, 3)
+        
+        surf = pygame.surfarray.make_surface(pixels)
+        self._blit_slice(ctx, surf, tx0, ty0)
 
     def _draw_base_terrain(self, ctx: RenderContext):
         if self.raw_terrain is not None:
-            self._draw_map(ctx, self.raw_terrain)
+            self._draw_map_vectorized(ctx, self.raw_terrain)
             
     def _draw_final_map(self, ctx: RenderContext):
         if self.final_map is not None:
-            self._draw_map(ctx, self.final_map)
+            self._draw_map_vectorized(ctx, self.final_map)
 
-    def _draw_map(self, ctx: RenderContext, data_map):
-        # Generic renderer for height maps using Martian Gradient
-        ts = self.ts
+    def _draw_map_vectorized(self, ctx: RenderContext, data_map):
+        # View Culling
+        tx0, tx1, ty0, ty1 = self._get_visible_bounds(ctx)
+        if tx1 <= tx0 or ty1 <= ty0: return
         
-        # Helper for color interpolation
-        def lerp_c(c1, c2, t):
-            t = clamp(t, 0.0, 1.0)
-            return (
-                int(c1[0] + (c2[0] - c1[0]) * t),
-                int(c1[1] + (c2[1] - c1[1]) * t),
-                int(c1[2] + (c2[2] - c1[2]) * t)
-            )
-
-        # Gradient: High Contrast (White -> Deep Orange -> Black)
-        c_low = (255, 245, 225) # Almost white / Pale sand
-        c_mid = (200, 70, 20)   # Vibrant Mars Red
-        c_high = (10, 5, 5)     # Almost black
-
-        for tile, val in np.ndenumerate(data_map):
-            # val is 0..1
-            # Shift mid point to 0.35 so we get to darks faster
-            th_low = 0.35 
-            th_high = 0.85 # Saturation point for black
+        vals = data_map[tx0:tx1, ty0:ty1]
+        
+        # Constants
+        th_low = 0.35
+        th_high = 0.85
+        
+        c_low = np.array([255, 245, 225])
+        c_mid = np.array([200, 70, 20])
+        c_high = np.array([10, 5, 5])
+        
+        out = np.zeros(vals.shape + (3,), dtype=np.uint8)
+        
+        mask_low = vals < th_low
+        if np.any(mask_low):
+            t = vals[mask_low] / th_low
+            t = t[..., np.newaxis]
+            cols = c_low * (1.0 - t) + c_mid * t
+            out[mask_low] = cols.astype(np.uint8)
             
-            if val < th_low:
-                # Low -> Mid
-                t = val / th_low
-                color = lerp_c(c_low, c_mid, t)
-            else:
-                # Mid -> High
-                # Map 0.35..0.85 to 0..1
-                t = (val - th_low) / (th_high - th_low)
-                # Clamp t at 1.0 for values > 0.85
-                if t > 1.0: t = 1.0
-                color = lerp_c(c_mid, c_high, t)
-                
-            draw_tile(ctx, tile, ts, color)
+        mask_high = ~mask_low
+        if np.any(mask_high):
+            t = (vals[mask_high] - th_low) / (th_high - th_low)
+            t = np.clip(t, 0.0, 1.0)[..., np.newaxis]
+            cols = c_mid * (1.0 - t) + c_high * t
+            out[mask_high] = cols.astype(np.uint8)
+            
+        surf = pygame.surfarray.make_surface(out)
+        self._blit_slice(ctx, surf, tx0, ty0)
 
     def _draw_water(self, ctx: RenderContext):
         if self.water_map is None: return
-        ts = self.ts
         
-        # Colors
-        c_shallow = (100, 200, 255) # Cyan
-        c_deep = (20, 40, 120)      # Deep Blue
-        c_river = (180, 220, 255)   # River Froth
+        tx0, tx1, ty0, ty1 = self._get_visible_bounds(ctx)
+        if tx1 <= tx0 or ty1 <= ty0: return
         
-        for tile, val in np.ndenumerate(self.water_map):
-            # Render Water Depth (Ground Water)
-            # Make it Darker to contrast with Rain
+        # Helper Slice
+        vals = self.water_map[tx0:tx1, ty0:ty1]
+        
+        # Check if empty (Optimization)
+        mask_water = vals > 0.005
+        has_water = np.any(mask_water)
+        
+        # If purely empty, skip
+        if not has_water and not self.rain_points:
+             return
+             
+        # Create pixels
+        pixels = np.zeros(vals.shape + (3,), dtype=np.uint8)
+        
+        # Water Render
+        if has_water:
+            v = vals[mask_water]
+            t = v / 0.15
+            t = np.clip(t, 0.0, 1.0)[..., np.newaxis]
             
-            if val > 0.005: # Slight threshold for standing water
-                # Depth Visualization
-                # Deep Blue / Navy
-                
-                t = val / 0.15 # saturation depth
-                t = clamp(t, 0.0, 1.0)
-                
-                # Colors: Darker Navy Gradient
-                c_shallow = (40, 60, 150)   # Dark Blue
-                c_deep = (10, 10, 50)       # Almost Black/Abyss
-                
-                # Lerp Color
-                r = int(c_shallow[0] + (c_deep[0] - c_shallow[0]) * t)
-                g = int(c_shallow[1] + (c_deep[1] - c_shallow[1]) * t)
-                b = int(c_shallow[2] + (c_deep[2] - c_shallow[2]) * t)
-                
-                draw_tile(ctx, tile, ts, (r, g, b))
-
-        # Render Rain (Fresh tracked particles)
-        # Bright Cyan / White for visibility
-        c_rain = (180, 240, 255)
+            c_shallow = np.array([40, 60, 150])
+            c_deep = np.array([10, 10, 50])
+            
+            cols = c_shallow * (1.0 - t) + c_deep * t
+            pixels[mask_water] = cols.astype(np.uint8)
+            
+        # Rain Render
+        c_rain = np.array([180, 240, 255], dtype=np.uint8)
+        w_slice, h_slice = pixels.shape[:2]
         
         for (rx, ry) in self.rain_points:
-            # Vectorized draw?
-            # pygame doesn't support list of rects easily, but we iterate arrays
-            for i in range(len(rx)):
-                tile = (rx[i], ry[i])
-                draw_tile(ctx, tile, ts, c_rain)
+            # Global rain arrays. Filter to local slice.
+            
+            # Local coords
+            lx = rx - tx0
+            ly = ry - ty0
+            
+            # Valid mask
+            valid = (lx >= 0) & (lx < w_slice) & (ly >= 0) & (ly < h_slice)
+            
+            if np.any(valid):
+                pixels[lx[valid], ly[valid]] = c_rain
+        
+        surf = pygame.surfarray.make_surface(pixels)
+        surf.set_colorkey((0, 0, 0))
+        self._blit_slice(ctx, surf, tx0, ty0)
 
 
 
