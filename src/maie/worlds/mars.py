@@ -24,11 +24,8 @@ class MarsConfig:
     crater_density_radius: float = 25.0 # For poisson sampling
     terrain_smoothing: float = 40.0 # Sigma for Voronoi blending (Higher = smoother, Lower = clearly defined plates)
     max_craters: int = 50 # Max number of craters to generate
-    sea_level: float = 0.2 # Target level for initial fill (used in instant gen)
-    num_rivers: int = 2000 # (Unused in Volumetric)
-    river_sim_speed: int = 5 # (Unused in Volumetric)
     rain_rate: float = 0.1 # Water added per frame to sources
-    sim_iterations: int = 20 # Physics steps per frame (Speed up)
+    sim_iterations: int = 1 # Physics steps per frame (Speed up)
 
 class MarsLayer(Enum):
     POINTS = auto()
@@ -114,7 +111,7 @@ class MarsWorld:
         
         # 1. Rain
         if self.rain_enabled:
-            drops = 200 
+            drops = 100 
             rx = np.random.randint(0, w, drops)
             ry = np.random.randint(0, h, drops)
             terrain_vals = self.final_map[rx, ry]
